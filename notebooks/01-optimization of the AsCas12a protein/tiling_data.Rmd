@@ -1,0 +1,274 @@
+---
+title: "R Notebook"
+output: html_notebook
+params: 
+  data: RDA_112_LFC.csv
+  p: 0.001
+---
+
+This notebook is for the first section of the Cas12a manuscript: otpimization of the AsCas12a protein
+
+# Setup and data exploration
+
+```{r}
+library(tidyverse)
+library(here)
+extrafont::loadfonts() 
+```
+
+```{r}
+get_replicate_cors <- function(lfc_data, gene_cell_conditons) {
+  replicate_lfcs <- lfc_data %>%
+    gather(column, LFC, -c(`Construct Barcode`:`Construct IDs`)) %>%
+    separate(column, c('treatment', 'rep'), sep = '\\|(?=(A\\||B\\|))') %>%
+    spread(rep, LFC) %>%
+    separate(`Construct IDs`, c('guide', 'gene'),sep = ';', drop = FALSE) %>%
+    mutate(`20mer` = substr(guide, 1, 20), 
+           Avg.LFC = (`A|LFC` + `B|LFC`)/2) %>%
+    group_by(treatment)
+  replicate_cors <- replicate_lfcs %>%
+    separate(treatment, sep = '\\|', into = c('Cell', 'RDA', 'Condition', 'dose','from')) %>%
+    rename(Gene = gene) %>%
+    inner_join(gene_cell_conditions) %>%
+    group_by(RDA,Cell, Condition, dose) %>%
+    nest() %>%
+    mutate(
+      cor_test = map(data, function(df) cor.test(df$`A|LFC`, df$`B|LFC`, method = 'pearson')),
+      tidy = map(cor_test, tidy)
+    ) %>%
+    unnest(tidy, .drop = TRUE)
+  cell_condition_cors <- replicate_cors %>%
+    group_by(Cell) %>%
+    mutate(Cell_obs = n()) %>%
+    group_by(Condition) %>%
+    mutate(Condition_obs = n()) %>%
+    ungroup() %>%
+    mutate(Cell = fct_reorder(Cell, -Cell_obs), 
+           Condition = fct_reorder(Condition, Condition_obs)) %>%
+    rename(Correlation = estimate)
+}
+```
+
+```{r}
+rda_085_data <- read_csv(here('data','interim','RDA_085_LFC.csv'))
+rda_112_data <- read_csv(here('data','interim','RDA_112_LFC.csv'))
+rda_113_data <- read_csv(here('data','interim','RDA_113_LFC.csv'))
+rda_174_data <- read_csv(here('data','interim','RDA_174_LFC.csv'))
+gene_cell_conditions <- read_csv(here('data','raw','gene_cell_conditions.csv'))
+
+# context_sequences = read_csv(here('ignored_data', 'metadata', 'sgrna_context.csv'))
+# expected_phenotypes = read_csv(here('ignored_data', 'metadata', 'expected_phenotypes.csv'))
+# gene_cell_conditions <- read_csv(here('ignored_data', 'metadata','gene_cell_conditions.csv'))
+# lfc_data
+```
+
+```{r}
+all_cas12a <- reduce(list(rda_112_data, rda_113_data, rda_174_data), inner_join)
+```
+
+# Replicate Correlations
+## Replicate Correlation - Reproducibility
+We want to select for conditions that have well correlated replicates
+
+```{r}
+
+ggplot(cell_condition_cors) +
+  aes(x = Cell, y = Condition, fill = Correlation, label = round(Correlation, 2)) +
+  geom_tile(color = 'black') +
+  scale_fill_gradient(low = '#fc8d59', high = '#7f0000') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        text = element_text(size = 10, family = 'Arial')) +
+  geom_text(aes(color = ifelse(Correlation > 0.39, 'white', 'black')), 
+            show.legend = FALSE, size = 3) +
+  coord_equal() +
+  guides(fill = guide_legend(title = 'Spearman')) +
+  scale_color_manual(values = c('white' = 'white', 'black' = 'black')) +
+  ggtitle('? \nReplicate Correlation')
+ggsave(here('ignored_data', 'figures', 'rda?_rep_cors.pdf'), width = 9, height = 9, units = 'cm')
+```
+
+```{r}
+gene_cors = replicate_lfcs %>%
+  group_by(treatment, gene) %>%
+  nest() %>%
+  mutate(
+    cor_test = map(data, function(df) cor.test(df$`A|LFC`, df$`B|LFC`)),
+    tidy = map(cor_test, tidy)
+  ) %>%
+  unnest(tidy, .drop = TRUE)
+
+signif_gene_cors = gene_cors %>%
+  filter(p.value < params$p)
+
+signif_gene_cors
+```
+
+## Comparison with flow genes - Activity
+```{r}
+flow_genes = c('CD33', 'CD81', 'ICAM1', 'FAS')
+flow_lfc = replicate_lfcs %>%
+  filter(gene %in% flow_genes)
+
+nested_flow = flow_lfc %>%
+  group_by(treatment) %>%
+  nest()
+
+nested_lfc = replicate_lfcs %>%
+  group_by(treatment, gene) %>%
+  filter(n() > 1) %>%
+  nest()
+
+control_all_lfc = inner_join(nested_flow, nested_lfc, suffix = c('.control', '.all'), 
+                             by = 'treatment') %>%
+  mutate(w_test = map2(data.control, data.all, 
+                       function(df_c, df_a) {
+                         wilcox.test(df_c$Avg.LFC, df_a$Avg.LFC)
+                       }), 
+         tidied = map(w_test, tidy), 
+         delta = map2(data.control, data.all, function(df_c, df_a)
+                      median(df_a$Avg.LFC) - median(df_c$Avg.LFC))) %>%
+  unnest(delta, tidied, .drop = TRUE)
+
+# Filter for conditions that are significant and in the expected directions
+gene_activity = control_all_lfc %>%
+  mutate(Drug = word(treatment, 3, sep = '\\|'), 
+         Sign_Delta = sign(delta)) %>%
+  inner_join(expected_phenotypes) %>%
+  filter((Direction == 'Dropout' & Sign_Delta == -1) |
+           (Direction == 'Either') |
+           (Direction == 'Enrichment' & Sign_Delta == 1))
+```
+
+```{r}
+gene_phenotypes = inner_join(gene_activity, gene_cors, 
+                                  by = c('treatment', 'gene'), suffix = c('.ks', '.pearson')) %>%
+  mutate(activity_rank = percent_rank(-p.value.ks),
+         reproducibility_rank = percent_rank(-p.value.pearson), 
+         mean_rank = (activity_rank + reproducibility_rank)/2) %>%
+  arrange(-mean_rank) %>%
+  separate(treatment, sep = '\\|', into = c('Cell', 'RDA', 'Condition', 'dose','from')) %>%
+  rename(Gene = gene) %>%
+  left_join(gene_cell_conditions %>% mutate(expected = TRUE)) %>%
+  mutate(expected = replace_na(expected, FALSE))
+
+ggplot(gene_phenotypes) +
+  aes(x = statistic.ks, y = statistic.pearson, color = expected) +
+  geom_point() +
+  theme(aspect.ratio = 1) +
+  facet_wrap(c('Cell', 'Condition'), scales = 'free') +
+  geom_text_repel(data = gene_phenotypes %>% filter(p.value.pearson < 1e-6, 
+                                              p.value.ks < 1e-6), 
+                   aes(label = Gene))
+```
+
+## Combining Signficantly Active Observations
+
+```{r}
+top_significant_data = all_significant_data %>%
+  group_by(gene) %>%
+  slice(which.max(mean_rank)) %>%
+  ungroup() %>%
+  filter(gene != 'EEF2-control') %>%
+  separate(treatment, sep = '\\|', c('Cell', 'RDA', 'Drug', 
+                                   'Dose', 'From'), remove = FALSE) %>%
+  arrange(Drug, Cell) 
+  
+
+top_significant_data['gene'] = factor(top_significant_data$gene, levels = top_significant_data$gene)
+
+
+top_significant_data %>%
+  arrange(-mean_rank) %>%
+  View()
+```
+
+```{r}
+ggplot(top_significant_data) +
+  aes(x = gene, y = Drug, fill = Cell, group = Drug) +
+  geom_tile(color = 'black') +
+  coord_equal() +
+  theme_classic2() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_brewer(palette = 'Set1')
+  
+```
+
+
+# Guide Ranking
+
+## Combining Guide Lengths
+
+```{r}
+significant_guides = replicate_lfcs %>%
+  inner_join(top_significant_data %>% select(gene, treatment, Sign_Delta)) %>%
+  mutate(`20mer` = substr(guide, 1, 20))
+
+length_spread = significant_guides %>%
+  select(-c(guide, `A|LFC`, `B|LFC`, `Construct Barcode`, Sign_Delta)) %>%
+  spread(Length, Avg.LFC) %>%
+  ungroup()
+
+length_spread %>% 
+  select(`20`:`23`) %>% 
+  as.matrix() %>% 
+  cor(use = 'pairwise.complete.obs') %>% 
+  corrplot(type = 'upper', addCoef.col = "black")
+```
+
+```{r}
+length_averaged_lfcs = significant_guides %>%
+  select(-c(guide, `A|LFC`, `B|LFC`, `Construct Barcode`)) %>%
+  group_by(treatment, gene, `20mer`, Sign_Delta, `Relative cleavage pos in CDS (%)`) %>%
+  summarise(Avg.LFC = mean(Avg.LFC)) %>%
+  group_by(gene) %>%
+  mutate(Sign.LFC = Sign_Delta * Avg.LFC,
+         Percent_Rank = percent_rank(Sign.LFC),
+         Drug = word(treatment, 3, sep = '\\|')) %>%
+  ungroup() 
+```
+
+```{r}
+ggplot(length_averaged_lfcs) +
+  aes(x = `Relative cleavage pos in CDS (%)`, y = Percent_Rank) +
+  geom_bin2d(binwidth = c(5, 0.1)) +
+  scale_fill_viridis_c() +
+  geom_smooth(method = 'loess', formula = 'y~x') 
+```
+
+```{r}
+# filter out guides in the first 5 and final 20 % of CDS and then rerank
+reranked_lfcs = length_averaged_lfcs %>%
+  filter((`Relative cleavage pos in CDS (%)` < 80) &
+         (`Relative cleavage pos in CDS (%)` > 5)) %>%
+  group_by(gene) %>%
+  mutate(Percent_Rank = percent_rank(Sign.LFC)) %>%
+  ungroup()
+
+ggplot(reranked_lfcs) +
+  aes(x = Avg.LFC, y = Percent_Rank, color = gene) +
+  geom_point() +
+  theme(aspect.ratio = 1) +
+  facet_wrap('Drug')
+```
+# Output
+
+```{r}
+# Join with context sequence for modeling
+joined_meta = context_sequences %>%
+  mutate(`20mer` = substr(`Guide Sequence`, 1, 20)) %>%
+  inner_join(reranked_lfcs)
+
+write_csv(joined_meta, here('ignored_data', 'filtered_activities', paste(Sys.Date(), word(params$data, sep = '\\.'),
+                                                                         'filtered.csv', sep = '_')))
+```
+
+
+
+
+
+
+
+
+
+
