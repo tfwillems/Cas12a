@@ -1,0 +1,164 @@
+---
+title: "Off Target Manuscript"
+author: "Peter DeWeirdt"
+date: "6/24/2019"
+output: 
+  html_document
+---
+
+# Setup and Data Exploration
+
+Our library has off target guides intended to target essential, 6TG, A133, Venurafenib, and flow genes. We test all drug arms for these targets except for A133, which we did not screen for. 
+
+```{r setup}
+library(tidyverse)
+library(broom)
+library(pheatmap)
+library(RColorBrewer)
+library(ggpubr)
+library(here)
+extrafont::loadfonts()
+```
+
+```{r}
+coallated_data = read_tsv(here('data','external', 'A375_reps_metainfo_v2.txt'))
+coallated_data %>%
+  group_by(Condition, wt_Length) %>%
+  summarise(n = n())
+```
+
+# Tidy Data
+```{r}
+print(colnames(coallated_data))
+# Tidy data up a bit
+melted_data = coallated_data %>%
+  gather(-c(`Cell Line`:`Guide_Type`), key = 'assay', value = 'LFC') %>%
+  separate(assay, into = c('Cell', 'RDA', 'Drug', 'Replicate'), sep = '_') %>%
+  group_by_at(vars(-LFC, -Replicate)) %>%
+  summarise(Avg.LFC = mean(LFC)) %>%
+  ungroup() %>%
+  mutate(Condition_MM = paste(Condition, MM_Type, sep = '_'),
+         RDA = fct_recode(RDA, Cas12a = "112", enCas12a = "174"))
+print(colnames(melted_data))
+```
+
+# CFD Matrices
+
+We use the 5th and 95th percentiles of flow guide log-fold changes as activity thresholds. We then calculate the fraction of active guides for each mismatch at each position. We refer the matrix of these values as the cutting frequency determination (CFD) matrix. 
+
+```{r}
+thresholds =  c(0.05, 0.95)
+activity_cutoffs = melted_data %>%
+  group_by(Drug, RDA) %>%
+  nest() %>%
+  mutate(
+    quant = map(data, function(df) quantile(df$Avg.LFC[df$Condition == 'Flow genes'], thresholds)),
+    tidied = map(quant, tidy)
+  ) %>%
+  unnest(tidied) %>%
+  spread(names, x) %>%
+  mutate(direction = recode(Drug, `6TG` = 1, `Dropout` = -1, `Vemurafenib` = 1),
+         Condition = recode(Drug, `6TG` = '6-Thioguanine'), 
+         Cutoff = ifelse(direction == 1, `95%`, `5%`))
+activity_cutoffs
+```
+
+```{r}
+one_mismatch_data = melted_data %>%
+  filter(MM_Type == 'single') %>%
+  mutate(MM_Pos_Iden = paste(MM_Position, MM_Identity, sep = '_'))
+melted_activity_data = one_mismatch_data %>%
+  inner_join(activity_cutoffs) %>%
+  group_by(RDA, Drug, wt_Length, MM_Pos_Iden) %>%
+  summarise(num =  ifelse(first(direction) == 1,
+                     sum(Avg.LFC > first(`95%`)), 
+                     sum(Avg.LFC < first(`5%`))),
+            denom = n(),
+            percent_active = num/denom) %>%
+  ungroup() %>%
+  mutate(context = paste(RDA, Drug, wt_Length, sep = '_'),
+         RDA = fct_recode(RDA, '2xNLS-Cas12a' = 'Cas12a'))
+```
+
+## Per WT length 
+
+## Per Condition
+We can see that the CFD matrices are the same across conditions 
+```{r}
+conditions_cfd = melted_activity_data %>%
+  group_by(RDA, Drug, MM_Pos_Iden) %>%
+  summarise(avg_percent_active = sum(num)/sum(denom)) %>%
+  separate(MM_Pos_Iden, c('Pos', 'MM'), sep = '_') %>%
+  mutate(Pos = as.numeric(Pos)) %>%
+  ungroup()
+
+ggplot(conditions_cfd) +
+  aes(x = Pos, y = MM, fill = avg_percent_active) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "black") +
+  facet_grid(c('RDA', 'Drug')) +
+  theme_classic() +
+  theme(text = element_text(size = 10, family = 'Arial'), 
+        legend.position = 'top', 
+        legend.key.height = unit(0.5, 'cm')) +
+  labs(fill = 'Fraction Active') +
+  xlab('Position') +
+  ylab('Mismatch') 
+ggsave(here('figures','off', 'all_cfds.pdf'), width = 18, height = 12, units = 'cm', 
+       useDingbats = FALSE)
+```
+
+```{r}
+rdas112_174_sum = melted_activity_data %>%
+  group_by(RDA, MM_Pos_Iden) %>%
+  summarise(avg_percent_active = sum(num)/sum(denom)) 
+
+rdas112_174_spread = rdas112_174_sum %>%
+  spread(RDA, avg_percent_active)
+
+ggplot(rdas112_174_spread) +
+  aes(x=`2xNLS-Cas12a`, y = enCas12a) +
+  geom_point(size = 0.5) +
+  theme_classic() +
+  theme(aspect.ratio = 1, text = element_text(size = 10, family = 'Arial')) +
+  stat_cor(aes(label = ..r.label..), method = 'spearman') +
+  geom_abline(intercept = 0, slope = 1) +
+  ggtitle('CFD Scores') +
+  xlab('2xNLS-Cas12a percent active') +
+  ylab('enCas12a percent active')
+ggsave(here('figures', 'off','monotonice_nonlinear.pdf'), width = 6, height = 6, units = 'cm', 
+       useDingbats = FALSE)
+```
+
+
+```{r}
+split_112_174 = rdas112_174_sum %>%
+  separate(MM_Pos_Iden, c('Pos', 'MM'), sep = '_') %>%
+  mutate(Pos = as.numeric(Pos)) %>%
+  ungroup()
+
+end_activity = melted_activity_data %>% 
+  separate(MM_Pos_Iden, c('Pos', 'MM'), sep = '_') %>%
+  mutate(Pos = as.numeric(Pos)) %>%
+  filter(Pos > 19) %>%
+  group_by(RDA) %>%
+  summarise(active = sum(num)/sum(denom))
+
+MM_activity = melted_activity_data %>% 
+  separate(MM_Pos_Iden, c('Pos', 'MM'), sep = '_') %>%
+  mutate(Pos = as.numeric(Pos)) %>%
+  filter(MM == 'rG:dT') %>%
+  group_by(RDA) %>%
+  summarise(active = sum(num)/sum(denom))
+
+ggplot(split_112_174) +
+  aes(x = Pos, y = MM, fill = avg_percent_active) +
+  geom_tile() +
+  scale_fill_viridis_c(option = 'C') +
+  facet_wrap('RDA') +
+  theme_classic() +
+  theme(aspect.ratio = 1) +
+  labs(fill = 'Percent Active')
+ggsave(here('figures', 'off','cfd.pdf'), width = 18, height = 6, units = 'cm', 
+       useDingbats = FALSE)
+```

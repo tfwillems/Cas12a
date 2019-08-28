@@ -260,6 +260,39 @@ guide2_base_lfcs <- filtered_lfcs %>%
   filter(control1) %>%
   group_by(`guide2`, DR, gene2, assay, DR_name) %>%
   summarise(`Base LFC 2` = mean(`Avg. LFC`))
+gene_base_lfcs <- guide1_base_lfcs %>%
+  rename(gene = gene1, `Base LFC` = `Base LFC 1`) %>%
+  bind_rows(guide2_base_lfcs %>%
+               rename(gene = gene2, `Base LFC` = `Base LFC 2`)) %>%
+  ungroup() %>%
+  mutate(gene = ifelse(grepl('OR', gene), 'control', gene)) %>%
+  group_by(gene, assay) %>%
+  summarise(`Avg. LFC` = mean(`Base LFC`)) %>%
+  ungroup() %>%
+  mutate(gene = fct_reorder(gene, -`Avg. LFC`))
+ggplot(gene_base_lfcs) +
+  aes(y = gene, x = assay, fill = `Avg. LFC`) +
+  geom_tile(color = 'black') +
+  theme(text = element_text(family = 'Arial', size = 10),
+        axis.text = element_text(color = 'black'),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.title = element_text(size = 8), 
+        legend.position = 'top') +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_y_discrete(expand = c(0,0)) +
+  scale_fill_gradient2(breaks = c(0,-1,-2)) +
+  coord_equal() +
+  xlab('') +
+  ylab('') +
+  guides(fill = guide_colorbar(title.position = 'top',
+                             label.theme = element_text(size = 8),
+                             barheight = unit(0.2, 'cm'), 
+                             barwidth = unit(1.3, 'cm')))
+ggsave(here('figures','synlet', 'single_gene_effect.pdf'), width = 6, height = 12, units = 'cm')
+```
+
+```{r}
 base_lfcs <- filtered_lfcs %>%
   inner_join(guide1_base_lfcs) %>%
   inner_join(guide2_base_lfcs) %>%
@@ -270,20 +303,28 @@ plot_model_fit <- function(base_lfcs, curr_assay) {
     filter(assay == curr_assay, 
            controls != 2) %>%
     mutate(type = ifelse(controls == 1, 'Control', 'Target'))
-  p <-  ggplot(assay_lfcs) +
+  control_lfcs = assay_lfcs %>%
+    filter(controls == 1)
+  control_residuals = lm(`Avg. LFC`~sum_lfc, data = control_lfcs)$residuals
+  control_error = mean(control_residuals) + 2*sd(control_residuals)
+  p <- ggplot(assay_lfcs) +
     aes(x = sum_lfc, y = `Avg. LFC`) +
-    geom_point_rast(alpha = 0.4, aes(color = type), raster.width = 3.2, raster.height = 3.2, 
-                    raster.dpi = 600) +
-    theme_classic() +
+    geom_point_rast(alpha = 0.7, aes(color = type), pch = 20, raster.width = 3.2, 
+                    raster.height = 3.2, raster.dpi = 600) +
     theme(text = element_text(size = 10, family = 'Arial'), 
-          aspect.ratio = 1, plot.title = element_text(size = 10, face = 'bold')) +
-    scale_color_brewer(palette = 'Paired') +
-    geom_smooth(data = base_lfcs %>% filter(controls == 1), 
-                method = 'lm', color = 'black', size = 0.5) +
+          aspect.ratio = 1, plot.title = element_text(size = 10, face = 'bold'), 
+          legend.key.size = unit(0.5, 'cm')) +
+    scale_color_manual(values = c('#ee854a', '#956cb4')) +
+    geom_smooth(data = base_lfcs %>% filter(controls == 1),
+                method = 'lm', color = 'black', size = 0.5, se = FALSE) +
+    geom_smooth(data = base_lfcs %>% filter(controls == 1) %>%
+                  mutate(down_lm = `Avg. LFC` - control_error),
+            aes(y = down_lm),
+            method = 'lm', linetype = 'dashed', size = 0.5, se = FALSE,
+            color = 'black') +
     ggtitle(paste(curr_assay,'Guide Pair LFCs')) +
     xlab('guide1/controls + controls/guide2') +
-    ylab('guide1/guide2') +
-    guides(color = guide_legend(override.aes = list(size = 0.5)))
+    ylab('guide1/guide2') 
   return(p)
 }
 plot_model_fit(base_lfcs, 'A375')
@@ -316,7 +357,8 @@ plot_residual_dist <- function(named_residuals, curr_assay) {
     group_by(name, ctl) %>%
     summarise(fraction_syn = sum(Residual < cutoff)/n(), 
               percent_syn = paste0(round(fraction_syn, 2)*100, '%'), 
-              n = n())
+              n = n(), 
+              number = paste0('n=', n))
   assay_named_resid <- assay_named_resid %>%
     full_join(percent_syn) %>%
     mutate(name = fct_reorder(name, fraction_syn))
@@ -333,6 +375,8 @@ plot_residual_dist <- function(named_residuals, curr_assay) {
           axis.text.y = element_text(color = 'black')) +
     geom_label(data = percent_syn, aes(x = -Inf, label = percent_syn, hjust = 0), 
                label.padding = unit(0.05, 'cm'), size = 3) +
+    geom_label(data = percent_syn, aes(x = Inf, label = n, hjust = 1), 
+           label.padding = unit(0.05, 'cm'), size = 3) +
     geom_vline(aes(xintercept = cutoff), linetype = 'dashed') +
     ylab('') +
     ggtitle(paste(curr_assay, 'Guide Pairs'))
@@ -628,27 +672,75 @@ guide2_base_lfcs_comp <- compare_set %>%
 compare_base_lfcs <- compare_set %>%
   inner_join(guide1_base_lfcs_comp) %>%
   inner_join(guide2_base_lfcs_comp) 
-compare_residuals <- get_guide_residuals(compare_base_lfcs, type = 'system')
-melted_compare_residuals <- compare_residuals %>%
-  filter(!(control1 | control2)) %>%
-  gather(type,`Avg. LFC`, `Avg. LFC`, `Expected LFC`) %>%
-  mutate(type = fct_recode(type,'Expected' = 'Expected LFC', 'Observed' = 'Avg. LFC'), 
-         type = factor(type, levels = c('Expected', 'Observed')))
+compare_residuals <- get_guide_residuals(compare_base_lfcs, type = 'system') %>%
+  mutate(Type = ifelse(control1 | control2, 'Control', 'Target'))
 ```
 
 ```{r}
-ggplot(melted_compare_residuals) +
-  aes(x = pair,fill = type, y = `Avg. LFC`) +
-  facet_grid(c('system', 'assay'), scales = 'free_y') +
-  geom_boxplot() +
-  theme_classic() +
-  theme(text = element_text(size = 10, family = 'Arial'),
-        axis.text.x = element_text(angle = 45, hjust = 1)) +
-  scale_fill_manual(values = c('#4878d0', '#ee854a')) +
-  stat_compare_means(aes(label = ..p.signif..), method = 't.test', 
-                       paired = TRUE, 
-                       method.args = list(alternative = "greater"))
+control_distributions <- compare_residuals %>%
+  filter(Type == 'Control') %>%
+  group_by(system, assay) %>%
+  summarise(control_mean = mean(Residual), control_sd = sd(Residual))
 ```
+
+
+```{r}
+max_y_range <- max(compare_residuals$Residual) - min(compare_residuals$Residual)
+for (curr_pair in unique(unlist(compare_residuals[!(compare_residuals$control1 | compare_residuals$control2), 'pair']))) {
+  for (curr_cell in unique(compare_residuals$assay)) {
+    genes = word(curr_pair, 1:2, sep = '_')
+    current_residuals <- compare_residuals %>%
+      filter(pair == curr_pair | (control1 & (gene2 %in% genes)) | 
+               (control2 & (gene1 %in% genes)), 
+             assay == curr_cell)
+    stat_test <- current_residuals %>%
+      group_by(system) %>%
+      nest() %>%
+      mutate(
+        spread = map(data, function(df) t.test(df$Residual[df$Type == 'Control'],
+                                                    df$Residual[df$Type == 'Target'], 
+                                                    alternative = 'greater')), 
+        tidied = map(spread, tidy)
+      ) %>%
+      unnest(tidied, .drop = TRUE)
+    dotsize = (max(current_residuals$Residual) - min(current_residuals$Residual))/max_y_range
+    ggplot(current_residuals) +
+      aes(x = system, y = Residual, fill = Type) +
+      geom_hline(yintercept = 0, linetype = 'dashed') +
+      geom_boxplot(outlier.size = 0.5) +
+      geom_dotplot(aes(alpha = Type), position = position_dodge(width = 0.75), 
+                   binaxis = 'y', stackdir = 'center', binwidth = 0.05, 
+                   dotsize = 2*dotsize, show.legend = F) +
+      scale_alpha_manual(values = c(0,1)) +
+      ggtitle(paste0(curr_pair, ' ', curr_cell)) +
+      geom_text(data = stat_test, aes(label = paste0('p=',signif(p.value, 2)), 
+                               y = Inf, vjust = 1, fill = NULL), 
+                size = 2.83) +
+      theme_classic() +
+      theme(text = element_text(size = 8, family = 'Arial'), 
+            plot.title = element_text(size = 8, face = 'bold', hjust = 0.5),
+            axis.title = element_text(size = 8), 
+            axis.text = element_text(size = 8, color= 'black'), 
+            legend.text = element_text(size = 8),
+            legend.key.size = unit(0.3, 'cm'), 
+            legend.position = 'top', 
+            legend.title = element_blank(), 
+            legend.box.margin = margin(0,0,0,0, unit = 'cm'), 
+            legend.margin = margin(0,0,0,0, unit = 'cm')) +
+      xlab('') +
+      ylab('') +
+      scale_fill_brewer(palette = 'Set1') 
+    ggsave(here('figures','synlet','system_comparison', paste0(curr_pair, '_',
+                                                               curr_cell, '.pdf')), 
+           useDingbats = F, width = 4.5, height = 6, units = 'cm')
+  }
+}
+```
+
+```{r}
+
+```
+
 
 ```{r}
 x_y_comparison <- compare_residuals %>%
@@ -671,8 +763,9 @@ en_bp_cor <- ggplot(x_y_comparison) +
   theme(text = element_text(size = 10, family = 'Arial'), 
         aspect.ratio = 1, 
         legend.spacing.y = unit(0, "cm")) +
-  stat_cor(aes(label = ..r.label..)) +
+  stat_cor(aes(label = ..r.label..), method = 'spearman') +
   scale_color_manual(values = c('#4878d0', '#ee854a'))
+en_bp_cor
 ggsave(here('figures','synlet','en_bp_cor.pdf'),en_bp_cor, width = 9, height = 6, units = 'cm', 
        useDingbats = FALSE)
 ```

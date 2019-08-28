@@ -1,0 +1,54 @@
+---
+title: "Compare On Targ"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(here)
+library(ggrepel)
+library(ggpubr)
+extrafont::loadfonts()
+```
+
+```{r}
+en_cas12a_feats <- read_csv(here('data','external','2019-08-02_2019-08-02_GB_regressor_EnCas12a_Train_model_mutagenisis_sat_mut.csv')) %>%
+  mutate(construct = 'enCas12a')
+cas12a2x_feats <- read_csv(here('data','external','2019-08-02_2019-08-02_GB_regressor_Cas12a2x_Train_model_mutagenisis_sat_mut.csv')) %>%
+  mutate(construct = '2xNLS-Cas12a')
+```
+
+
+```{r}
+bound_feats <- bind_rows(en_cas12a_feats, cas12a2x_feats)
+spread_feats <- bound_feats %>%
+  spread(construct, avg_delta) %>%
+  mutate(delta_imp = abs(lm(`enCas12a` ~`2xNLS-Cas12a`)$residual), 
+         delta = abs(`2xNLS-Cas12a` - `enCas12a`))
+big_delta <- spread_feats %>%
+  top_n(3, delta_imp)
+```
+
+```{r}
+ggplot(spread_feats) +
+  aes(x = `2xNLS-Cas12a`, y = `enCas12a`) +
+  theme_classic() +
+  theme(text = element_text(size = 10, family = 'Arial'),
+        aspect.ratio = 1) +
+  stat_cor(size= 2.83, aes(label = ..r.label..), method = 'spearman') +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0) +
+  geom_smooth(method = 'lm', size = 0.5, color = 'grey', se = FALSE) +
+  geom_point(alpha = 0.7, pch = 20) +
+  geom_label_repel(data = big_delta, 
+                 aes(label = paste0(position, nt)), 
+                 point.padding = 0.2, 
+                 min.segment.length = 0, 
+                 label.padding = 0.1, 
+                 size = 2.83) +
+  xlab('2xNLS-Cas12a\n(Avg. Delta)') +
+  ylab('enCas12a\n(Avg. Delta)')
+ggsave(here('figures','ML', 'nt_feats.pdf'), width = 6, height = 6, units = 'cm', 
+       useDingbats = FALSE)
+```
+

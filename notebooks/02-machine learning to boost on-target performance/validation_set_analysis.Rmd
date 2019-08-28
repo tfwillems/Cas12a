@@ -1,0 +1,118 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Setup
+
+```{r}
+library(tidyverse)
+library(here)
+extrafont::loadfonts()
+library(ggpubr)
+library(ggsci)
+```
+
+```{r}
+predictions <- c('2019-08-02_GB_regressor_Cas12a2x_Train_model_Cas12a2x_Test.csv',
+                 '2019-08-02_GB_regressor_Cas12a2x_Train_model_EnCas12a_Test.csv',
+                 '2019-08-02_GB_regressor_Cas12a2x_Train_model_SynCas12a_Test.csv',
+                 '2019-08-02_GB_regressor_EnCas12a_Train_model_Cas12a2x_Test.csv',
+                 '2019-08-02_GB_regressor_EnCas12a_Train_model_EnCas12a_Test.csv',
+                 '2019-08-02_GB_regressor_EnCas12a_Train_model_SynCas12a_Test.csv',
+                 '2019-08-02_GB_regressor_SynCas12a_Train_model_Cas12a2x_Test.csv',
+                 '2019-08-02_GB_regressor_SynCas12a_Train_model_EnCas12a_Test.csv',
+                 '2019-08-02_GB_regressor_SynCas12a_Train_model_SynCas12a_Test.csv',
+                 'Seq-DeepCfp1_Cas12a2x_Test.csv',
+                 'Seq-DeepCfp1_EnCas12a_Test.csv',
+                 'Seq-DeepCfp1_SynCas12a_Test.csv')
+models <- c('GB 2xNLS-Cas12a',
+           'GB 2xNLS-Cas12a',
+           'GB 2xNLS-Cas12a',
+           'GB enCas12a',
+           'GB enCas12a',
+           'GB enCas12a',
+           'GB Synthetic',
+           'GB Synthetic',
+           'GB Synthetic',
+           'Seq-DeepCfp1',
+           'Seq-DeepCfp1',
+           'Seq-DeepCfp1')
+test_sets <- c('2xNLS-Cas12a Tiling',
+             'enCas12a Tiling',
+             'Cas12a Synthetic',
+             '2xNLS-Cas12a Tiling',
+             'enCas12a Tiling',
+             'Cas12a Synthetic',
+             '2xNLS-Cas12a Tiling',
+             'enCas12a Tiling',
+             'Cas12a Synthetic',
+             '2xNLS-Cas12a Tiling',
+             'enCas12a Tiling',
+             'Cas12a Synthetic')
+tttn_correlations <- vector(mode ='numeric', length = length(predictions))
+tttv_correlations <- tttn_correlations
+for (i in 1:length(predictions)) {
+  prediction_df <- read_csv(here('data','external',predictions[i]))
+  model <- models[i]
+  test_set <- models[i]
+  tttn_correlations[[i]] <- cor(prediction_df$y, prediction_df$prediction, 
+                                method = 'spearman')
+  TTTV_df <- prediction_df %>%
+    mutate(PAM = substr(kmer, 5, 8)) %>%
+    filter(PAM != 'TTTT')
+  tttv_correlations[[i]] <- cor(TTTV_df$y, TTTV_df$prediction, method = 'spearman')
+}
+prediction_cors <- tibble(Model = models, `Hold Out Set` = test_sets, TTTN = tttn_correlations, 
+                      TTTV = tttv_correlations) %>%
+  gather(PAM, Spearman, TTTN, TTTV) %>%
+  mutate(Model = fct_reorder(Model, Spearman), 
+         `Hold Out Set` = factor(`Hold Out Set`, levels = c('2xNLS-Cas12a Tiling',
+                                                            'enCas12a Tiling',
+                                                            'Cas12a Synthetic')))
+```
+
+```{r}
+ggplot(prediction_cors) +
+  aes(x = `Hold Out Set`, y = Spearman, alpha = PAM, fill = Model) +
+  scale_fill_brewer(palette = 'Set1', direction = -1) +
+  geom_bar(stat = 'identity', position = 'dodge2') +
+  theme_classic() +
+  theme(text = element_text(size = 10, family = 'Arial'), 
+        plot.title = element_text(size = 10, face = 'bold'), 
+        axis.ticks.x = element_blank(), 
+        legend.key.size = unit(0.3, 'cm')) +
+  scale_alpha_manual(values = c(1,0.5)) +
+  ggtitle('Model Performance') +
+  guides(fill = FALSE)
+ggsave(here('figures','ML','Rule_Set_Performances.pdf'), 
+       width = 17.5, height = 5.5, units = 'cm')
+```
+
+
+```{r}
+seq_deep_2xCas12a_predictions <- read_csv(here('data','external','Seq-DeepCfp1_Cas12a2x_Test.csv')) %>%
+  rename('Seq-Deepcpf1' = 'prediction')
+GB2x_2xCas12a_predictions <- read_csv(here('data','external',
+                                           '2019-08-02_GB_regressor_Cas12a2x_Train_model_Cas12a2x_Test.csv')) %>%
+  rename('GB 2x-NLS Cas12a' = 'prediction')
+
+merged_predictions <- inner_join(seq_deep_2xCas12a_predictions, GB2x_2xCas12a_predictions) %>%
+  mutate(PAM = substr(kmer, 5, 8))
+ggplot(merged_predictions) + 
+  aes(y = `Seq-Deepcpf1`, x = `GB 2x-NLS Cas12a`) +
+  theme_classic() +
+  theme(text = element_text(size = 10, family = 'Arial'), 
+        plot.title = element_text(size = 10, face = 'bold'),
+        legend.key.size = unit(0.3, 'cm'), 
+        aspect.ratio = 1) +
+  geom_point(aes(color = PAM), size = 0.5) +
+  scale_color_brewer(palette = 'Paired') +
+  ggtitle('2xNLS-Cas12a Hold Out Set') +
+  stat_cor(method = 'spearman', size = 2.83, aes(label = ..r.label..)) +
+  xlab('GB 2x-NLS Cas12a\n(Activity Percentile)') +
+  ylab('Seq-DeepCpf1\n(Indel Frequency %)')
+ggsave(here('figures','ML','prediction_cor.pdf'), width = 9, height = 6, units = 'cm', 
+       useDingbats = FALSE)
+```
+

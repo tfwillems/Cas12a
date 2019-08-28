@@ -1,0 +1,378 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(tidyverse) 
+library(ggrepel) 
+library(broom)
+library(here)
+library(RColorBrewer)
+library(extrafont)
+loadfonts()
+```
+
+
+```{r}
+rep_spread_cas12a <- read_csv(here('data','interim','cas12a_spread_context.csv')) 
+gene_cell_conditions <- read_csv(here('data','raw','gene_cell_conditions.csv'))
+```
+
+# Evaluating sets for training: pearson wilconxon's signed-rank test
+
+```{r}
+gene_correlations <- rep_spread_cas12a %>%
+  group_by_at(vars(Gene:Measure)) %>%
+  nest() %>%
+  mutate(cor_test = map(data, function (df) cor.test(df$A,df$B)), 
+         tidied = map(cor_test, tidy)) %>%
+  unnest(tidied, .drop = TRUE)
+flow_genes <- c('CD81', 'CD33', 'FAS', 'ICAM1')
+rep_spread_controls <- rep_spread_cas12a %>%
+  filter(Gene %in% flow_genes) 
+nested_controls <- rep_spread_controls %>%
+  group_by_at(vars(Cell:Measure)) %>%
+  nest()
+gene_wilcox <- rep_spread_cas12a %>%
+  group_by_at(vars(Gene:Measure)) %>%
+  nest() %>%
+  inner_join(nested_controls, suffix = c('','.control'), 
+             by  = c("Cell", "RDA", "Condition", "dose", "from", "Measure")) %>%
+  mutate(wilcox_test = map2(data, data.control, 
+                            function (df1, df2) {
+                              wilcox.test(df1$Avg.LFC,df2$Avg.LFC)
+                              }
+                            ),
+         median_delta = map2(data, data.control, 
+                             function(df1, df2) {
+                               median(df1$Avg.LFC) - median(df2$Avg.LFC)
+                             }),
+         tidied = map(wilcox_test, tidy)) %>%
+  unnest(tidied, median_delta,.drop = TRUE)
+gene_summary_stats <- inner_join(gene_correlations, gene_wilcox, 
+                                 by = c("Gene", "Cell", "RDA",
+                                        "Condition", "dose", "from", "Measure"), 
+                                 suffix = c('.cor','.wilcox')) %>%
+  inner_join(rep_spread_cas12a %>%
+               group_by_at(vars(Gene:Measure)) %>%
+               summarise(n = n())) %>%
+  left_join(gene_cell_conditions %>% mutate(Expected = TRUE)) %>%
+  mutate(Expected = replace_na(Expected, FALSE)) %>%
+  unite(treatment, Cell:Measure, remove = FALSE)
+```
+
+There are plenty of instances of seeing strong correlations and signficant deviations from controls which we did not intend. These deviations can largely be explained by essential genes maintaining a viability effect in positive selection screens. 
+
+```{r}
+ggplot(gene_summary_stats) +
+  aes(x = -log10(p.value.cor), y = -log10(p.value.wilcox), label = Gene, color = Expected) +
+  facet_wrap('treatment', scales = 'free') +
+  geom_point() +
+  scale_color_brewer(palette = 'Paired') +
+  geom_text_repel(data = gene_summary_stats %>% 
+                    filter(p.value.wilcox < 0.001, p.value.cor < 0.001, 
+                           Expected == FALSE))
+```
+
+For training and testing we will just stick with the expected phenotypes. 
+
+```{r}
+model_conditions <- gene_summary_stats %>% 
+                    filter(p.value.wilcox < 0.001, p.value.cor < 0.001, 
+                           Expected == TRUE)
+model_conditions %>%
+  group_by(RDA) %>%
+  summarise(genes = n_distinct(Gene))
+```
+
+# Prepare data for training and testing
+
+```{r}
+cas12a_expected_percentiles <- rep_spread_cas12a %>%
+  inner_join(model_conditions %>% select(Gene:Measure, median_delta)) %>%
+  mutate(sign_lfc = median_delta*Avg.LFC, 
+         sign = sign(median_delta)) %>%
+  group_by_at(vars(Gene:Measure)) %>%
+  mutate(percent_rank = percent_rank(sign_lfc))
+context_avg_percentiles <- cas12a_expected_percentiles %>% 
+  group_by(construct, Gene, `Context Sequence`, PAM, sign) %>%
+  summarise(avg_percenitle = mean(percent_rank)) %>%
+  group_by(Gene) %>%
+  mutate(distinct = n_distinct(`Context Sequence`)) %>%
+  ungroup() %>%
+  mutate(Gene = fct_reorder2(Gene, sign, -distinct))
+testing_2x <- c('TFRC','BCL2L1','CUL3','FBXO42', 'NFE2L2')
+testing_en <- c('TFRC','CUL3','PELP1', 'PSMA6')
+training_sizes <- context_avg_percentiles %>% 
+  filter(construct %in% c('2xNLS-Cas12a', 'enCas12a')) %>%
+  group_by(Gene, sign, construct) %>%
+  summarise(n = n()) %>%
+  mutate(test = ifelse(((Gene %in% testing_2x) & (construct == '2xNLS-Cas12a')) | 
+                         ((Gene %in% testing_en) & (construct == 'enCas12a')),
+                       TRUE, FALSE), 
+         type = ifelse(test, 'test', 'train'), 
+         direction = ifelse(sign == -1, 'neg.', 'pos.'), 
+         type = factor(type, levels = c('train','test'))) %>%
+  mutate(short_construct = fct_recode(construct,'2xNLS' = '2xNLS-Cas12a'))
+ggplot(training_sizes) +
+  aes(x = direction, y= n, fill = Gene, label = Gene) +
+  geom_bar(stat = 'identity', color = 'black') +
+  # geom_label(data = training_sizes %>%
+  #                   group_by(construct, test, sign) %>%
+  #                   top_n(1, n),
+  #                 position = position_stack(vjust = 0.5),
+  #           size = 2.83,
+  #           label.padding = unit(0.05, 'cm')) +
+  facet_grid(c('short_construct', 'type'), scales = 'free_y') +
+  theme_classic() +
+  theme(text = element_text(size = 10, family = 'Arial'), 
+        plot.title = element_text(size = 10, face = 'Bold'), 
+        strip.text = element_text( margin = margin( b = 3, t = 3, l = 3, r = 3) )) +
+  guides(fill = FALSE) +
+  ylab('Target Sites') +
+  xlab('Selection') 
+ggsave(here('figures','ML', 'train_test.pdf'), useDingbats = FALSE, 
+       width = 5, height = 5, units = 'cm')
+```
+
+number of context sequences 
+
+```{r}
+training_sizes %>%
+  group_by(construct, type) %>%
+  summarise(sum(n))
+```
+
+number of genes
+
+```{r}
+training_sizes %>%
+  group_by(construct, type) %>%
+  summarise(n())
+```
+
+# Save Data
+
+```{r}
+train_test_sets <- context_avg_percentiles %>%
+  ungroup() %>%
+  inner_join(training_sizes %>% select(Gene, construct, type))
+encas12a_train <- train_test_sets %>%
+  filter(type == 'train', construct == 'enCas12a')
+encas12a_test <- train_test_sets %>%
+  filter(type == 'test', construct == 'enCas12a')
+cas12a2x_train <- train_test_sets %>%
+  filter(type == 'train', construct == '2xNLS-Cas12a')
+cas12a2x_test <- train_test_sets %>%
+  filter(type == 'test', construct == '2xNLS-Cas12a')
+write_csv(encas12a_train, here('data','processed', 'encas12a_train.csv'))
+write_csv(encas12a_test, here('data','processed', 'encas12a_test.csv'))
+write_csv(cas12a2x_train, here('data','processed', '2xnls_cas12a_train.csv'))
+write_csv(cas12a2x_test, here('data','processed', '2xnls_cas12a_test.csv'))
+```
+
+
+# Selecting Expected Phenotypes
+Note: we're not trying to discover new phenotypes, so we'll join with the expected phenotypes
+```{r}
+expected_phenos_cas12a <- rep_spread_cas12a %>%
+  inner_join(gene_cell_conditions)
+```
+
+# Replicate Correlations
+## Replicate Correlation - Reproducibility
+We want to select for conditions that have well correlated replicates
+
+```{r}
+
+ggplot(cell_condition_cors) +
+  aes(x = Cell, y = Condition, fill = Correlation, label = round(Correlation, 2)) +
+  geom_tile(color = 'black') +
+  scale_fill_gradient(low = '#fc8d59', high = '#7f0000') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        text = element_text(size = 10, family = 'Arial')) +
+  geom_text(aes(color = ifelse(Correlation > 0.39, 'white', 'black')), 
+            show.legend = FALSE, size = 3) +
+  coord_equal() +
+  guides(fill = guide_legend(title = 'Spearman')) +
+  scale_color_manual(values = c('white' = 'white', 'black' = 'black')) +
+  ggtitle('? \nReplicate Correlation')
+ggsave(here('ignored_data', 'figures', 'rda?_rep_cors.pdf'), width = 9, height = 9, units = 'cm')
+```
+
+```{r}
+gene_cors = replicate_lfcs %>%
+  group_by(treatment, gene) %>%
+  nest() %>%
+  mutate(
+    cor_test = map(data, function(df) cor.test(df$`A|LFC`, df$`B|LFC`)),
+    tidy = map(cor_test, tidy)
+  ) %>%
+  unnest(tidy, .drop = TRUE)
+
+signif_gene_cors = gene_cors %>%
+  filter(p.value < params$p)
+
+signif_gene_cors
+```
+
+## Comparison with flow genes - Activity
+```{r}
+flow_genes = c('CD33', 'CD81', 'ICAM1', 'FAS')
+flow_lfc = replicate_lfcs %>%
+  filter(gene %in% flow_genes)
+
+nested_flow = flow_lfc %>%
+  group_by(treatment) %>%
+  nest()
+
+nested_lfc = replicate_lfcs %>%
+  group_by(treatment, gene) %>%
+  filter(n() > 1) %>%
+  nest()
+
+control_all_lfc = inner_join(nested_flow, nested_lfc, suffix = c('.control', '.all'), 
+                             by = 'treatment') %>%
+  mutate(w_test = map2(data.control, data.all, 
+                       function(df_c, df_a) {
+                         wilcox.test(df_c$Avg.LFC, df_a$Avg.LFC)
+                       }), 
+         tidied = map(w_test, tidy), 
+         delta = map2(data.control, data.all, function(df_c, df_a)
+                      median(df_a$Avg.LFC) - median(df_c$Avg.LFC))) %>%
+  unnest(delta, tidied, .drop = TRUE)
+
+# Filter for conditions that are significant and in the expected directions
+gene_activity = control_all_lfc %>%
+  mutate(Drug = word(treatment, 3, sep = '\\|'), 
+         Sign_Delta = sign(delta)) %>%
+  inner_join(expected_phenotypes) %>%
+  filter((Direction == 'Dropout' & Sign_Delta == -1) |
+           (Direction == 'Either') |
+           (Direction == 'Enrichment' & Sign_Delta == 1))
+```
+
+```{r}
+gene_phenotypes = inner_join(gene_activity, gene_cors, 
+                                  by = c('treatment', 'gene'), suffix = c('.ks', '.pearson')) %>%
+  mutate(activity_rank = percent_rank(-p.value.ks),
+         reproducibility_rank = percent_rank(-p.value.pearson), 
+         mean_rank = (activity_rank + reproducibility_rank)/2) %>%
+  arrange(-mean_rank) %>%
+  separate(treatment, sep = '\\|', into = c('Cell', 'RDA', 'Condition', 'dose','from')) %>%
+  rename(Gene = gene) %>%
+  left_join(gene_cell_conditions %>% mutate(expected = TRUE)) %>%
+  mutate(expected = replace_na(expected, FALSE))
+
+ggplot(gene_phenotypes) +
+  aes(x = statistic.ks, y = statistic.pearson, color = expected) +
+  geom_point() +
+  theme(aspect.ratio = 1) +
+  facet_wrap(c('Cell', 'Condition'), scales = 'free') +
+  geom_text_repel(data = gene_phenotypes %>% filter(p.value.pearson < 1e-6, 
+                                              p.value.ks < 1e-6), 
+                   aes(label = Gene))
+```
+
+## Combining Signficantly Active Observations
+
+```{r}
+top_significant_data = all_significant_data %>%
+  group_by(gene) %>%
+  slice(which.max(mean_rank)) %>%
+  ungroup() %>%
+  filter(gene != 'EEF2-control') %>%
+  separate(treatment, sep = '\\|', c('Cell', 'RDA', 'Drug', 
+                                   'Dose', 'From'), remove = FALSE) %>%
+  arrange(Drug, Cell) 
+  
+
+top_significant_data['gene'] = factor(top_significant_data$gene, levels = top_significant_data$gene)
+
+
+top_significant_data %>%
+  arrange(-mean_rank) %>%
+  View()
+```
+
+```{r}
+ggplot(top_significant_data) +
+  aes(x = gene, y = Drug, fill = Cell, group = Drug) +
+  geom_tile(color = 'black') +
+  coord_equal() +
+  theme_classic2() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_brewer(palette = 'Set1')
+  
+```
+
+
+# Guide Ranking
+
+## Combining Guide Lengths
+
+```{r}
+significant_guides = replicate_lfcs %>%
+  inner_join(top_significant_data %>% select(gene, treatment, Sign_Delta)) %>%
+  mutate(`20mer` = substr(guide, 1, 20))
+
+length_spread = significant_guides %>%
+  select(-c(guide, `A|LFC`, `B|LFC`, `Construct Barcode`, Sign_Delta)) %>%
+  spread(Length, Avg.LFC) %>%
+  ungroup()
+
+length_spread %>% 
+  select(`20`:`23`) %>% 
+  as.matrix() %>% 
+  cor(use = 'pairwise.complete.obs') %>% 
+  corrplot(type = 'upper', addCoef.col = "black")
+```
+
+```{r}
+length_averaged_lfcs = significant_guides %>%
+  select(-c(guide, `A|LFC`, `B|LFC`, `Construct Barcode`)) %>%
+  group_by(treatment, gene, `20mer`, Sign_Delta, `Relative cleavage pos in CDS (%)`) %>%
+  summarise(Avg.LFC = mean(Avg.LFC)) %>%
+  group_by(gene) %>%
+  mutate(Sign.LFC = Sign_Delta * Avg.LFC,
+         Percent_Rank = percent_rank(Sign.LFC),
+         Drug = word(treatment, 3, sep = '\\|')) %>%
+  ungroup() 
+```
+
+```{r}
+ggplot(length_averaged_lfcs) +
+  aes(x = `Relative cleavage pos in CDS (%)`, y = Percent_Rank) +
+  geom_bin2d(binwidth = c(5, 0.1)) +
+  scale_fill_viridis_c() +
+  geom_smooth(method = 'loess', formula = 'y~x') 
+```
+
+```{r}
+# filter out guides in the first 5 and final 20 % of CDS and then rerank
+reranked_lfcs = length_averaged_lfcs %>%
+  filter((`Relative cleavage pos in CDS (%)` < 80) &
+         (`Relative cleavage pos in CDS (%)` > 5)) %>%
+  group_by(gene) %>%
+  mutate(Percent_Rank = percent_rank(Sign.LFC)) %>%
+  ungroup()
+
+ggplot(reranked_lfcs) +
+  aes(x = Avg.LFC, y = Percent_Rank, color = gene) +
+  geom_point() +
+  theme(aspect.ratio = 1) +
+  facet_wrap('Drug')
+```
+# Output
+
+```{r}
+# Join with context sequence for modeling
+joined_meta = context_sequences %>%
+  mutate(`20mer` = substr(`Guide Sequence`, 1, 20)) %>%
+  inner_join(reranked_lfcs)
+
+write_csv(joined_meta, here('ignored_data', 'filtered_activities', paste(Sys.Date(), word(params$data, sep = '\\.'),
+                                                                         'filtered.csv', sep = '_')))
+```
+
