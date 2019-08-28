@@ -245,7 +245,6 @@ a375_guide_lfcs <- a375_p_lfcs$lfcs %>%
             avg_lfc_pos2 = mean(`Avg. LFC (Pos. 2)`)) 
 all_guide_lfcs <- bind_rows(ovc_guide_lfcs, a375_guide_lfcs) %>%
   arrange(-avg_lfc_pos1)
-write_csv(all_guide_lfcs, here('tables', 'synlet', 'positional_effects.csv'))
 ```
 
 
@@ -335,6 +334,7 @@ ggsave(here('figures','synlet','ovcar8_linear_model.pdf'), useDingbats = FALSE,
        width = 8, height = 8, units = 'cm')
 
 guide_residuals <- get_guide_residuals(base_lfcs, type = 'assay')
+write_csv(guide_residuals, here('processed_data', '2019-08-28_synlet_guide_residuals.csv'))
 ```
 
 
